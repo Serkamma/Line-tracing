@@ -1,0 +1,14 @@
+void loop() {
+  if (leftSensor == LOW && rightSensor == LOW) {
+    goForward();
+  }
+  else if (leftSensor == LOW && rightSensor == HIGH) {
+    turnLeft();
+  }
+  else if (leftSensor == HIGH && rightSensor == LOW) {
+    turnRight();
+  }
+  else {
+    stop();
+  }
+}
