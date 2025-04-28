@@ -1,0 +1,428 @@
+#include <QTRSensors.h>
+
+// Pin definitions
+#define AIN1 7      // Left motor direction 1
+#define AIN2 8      // Left motor direction 2
+#define PWMA 9      // Left motor PWM speed control
+#define BIN1 12     // Right motor direction 1
+#define BIN2 13     // Right motor direction 2
+#define PWMB 11     // Right motor PWM speed control
+#define STBY 10     // Standby pin for L298N
+#define BUTTON_PIN 2 // Optional button for start/stop (connect to GND when pressed)
+
+// Sensor array configuration
+#define NUM_SENSORS 5
+#define LINE_THRESHOLD 700    // Threshold for line detection (black vs white)
+#define POSITION_CENTER 2000  // Center position value (0-4000 for 5 sensors)
+#define CALIBRATION_SAMPLES 300
+
+// Motor parameters
+#define MAX_SPEED 255
+#define BASE_SPEED 170      // Adjusted base speed for stability
+#define MIN_SPEED 40        // Minimum speed for effective motor movement
+
+// PID Controller parameters (start with conservative values)
+float Kp = 0.25;            // Proportional gain
+float Ki = 0.0001;          // Integral gain
+float Kd = 2.0;             // Derivative gain
+
+// Safety & recovery parameters
+#define MAX_INTEGRAL 50000  // Prevent integral windup
+#define LINE_LOST_THRESHOLD 800  // Threshold to determine if line is lost
+#define RECOVERY_SPEED 160  // Speed for recovery maneuvers
+
+// QTR Sensor setup
+QTRSensors qtr;
+uint16_t sensorValues[NUM_SENSORS];
+uint16_t positionValue;
+
+// PID control variables
+int32_t error = 0;
+int32_t lastError = 0;
+int32_t integral = 0;
+int32_t derivative = 0;
+int16_t motorSpeed = 0;
+bool runningMode = false;
+
+// System state variables
+uint32_t lastDebugOutput = 0;
+bool lineLost = false;
+uint32_t lineLastSeen = 0;
+
+void setup() {
+  // Configure serial communication
+  Serial.begin(115200);
+  
+  // Configure motor control pins
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+  pinMode(PWMA, OUTPUT);
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+  pinMode(PWMB, OUTPUT);
+  pinMode(STBY, OUTPUT);
+  pinMode(LED_BUILTIN, OUTPUT);
+  
+  if (BUTTON_PIN != -1) {
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
+  }
+  
+  // Activate L298N motor driver
+  digitalWrite(STBY, HIGH);
+  
+  // Configure QTR sensors
+  qtr.setTypeAnalog();
+  qtr.setSensorPins((const uint8_t[]){A0, A1, A2, A3, A4}, NUM_SENSORS);
+  
+  // Perform sensor calibration
+  calibrateSensors();
+  
+  // Initialize system
+  resetPID();
+  printSystemInfo();
+  
+  // Wait for startup (safety)
+  delay(1000);
+}
+
+void loop() {
+  // Check for commands or button press
+  checkUserInput();
+  
+  // Read line position
+  positionValue = qtr.readLineBlack(sensorValues);
+  
+  if (runningMode) {
+    // Determine if line is visible
+    bool lineVisible = checkLineVisibility();
+    
+    if (lineVisible) {
+      // Normal line following with PID
+      calculatePID();
+      setMotorSpeeds();
+      lineLost = false;
+      lineLastSeen = millis();
+    } else {
+      // Line recovery behavior
+      handleLineLost();
+    }
+    
+    // Print debug information periodically
+    if (millis() - lastDebugOutput > 250) {
+      printDebugInfo();
+      lastDebugOutput = millis();
+    }
+  } else {
+    // Robot is stopped
+    stopMotors();
+  }
+}
+
+void calculatePID() {
+  // Calculate error from center position
+  error = POSITION_CENTER - positionValue;
+  
+  // Calculate integral with anti-windup
+  integral += error;
+  integral = constrain(integral, -MAX_INTEGRAL, MAX_INTEGRAL);
+  
+  // Calculate derivative
+  derivative = error - lastError;
+  lastError = error;
+  
+  // Calculate motor correction
+  motorSpeed = (Kp * error) + (Ki * integral) + (Kd * derivative);
+}
+
+void setMotorSpeeds() {
+  // Calculate left and right motor speeds based on PID
+  int16_t leftSpeed = BASE_SPEED - motorSpeed;
+  int16_t rightSpeed = BASE_SPEED + motorSpeed;
+  
+  // Ensure minimum effective speed
+  if (leftSpeed > 0 && leftSpeed < MIN_SPEED) leftSpeed = MIN_SPEED;
+  if (rightSpeed > 0 && rightSpeed < MIN_SPEED) rightSpeed = MIN_SPEED;
+  
+  // Apply speed limits
+  leftSpeed = constrain(leftSpeed, -MAX_SPEED, MAX_SPEED);
+  rightSpeed = constrain(rightSpeed, -MAX_SPEED, MAX_SPEED);
+  
+  // Set motor directions and speeds
+  // Left motor
+  if (leftSpeed >= 0) {
+    digitalWrite(AIN1, HIGH);
+    digitalWrite(AIN2, LOW);
+    analogWrite(PWMA, leftSpeed);
+  } else {
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, HIGH);
+    analogWrite(PWMA, -leftSpeed);
+  }
+  
+  // Right motor
+  if (rightSpeed >= 0) {
+    digitalWrite(BIN1, HIGH);
+    digitalWrite(BIN2, LOW);
+    analogWrite(PWMB, rightSpeed);
+  } else {
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, HIGH);
+    analogWrite(PWMB, -rightSpeed);
+  }
+}
+
+void stopMotors() {
+  digitalWrite(AIN1, LOW);
+  digitalWrite(AIN2, LOW);
+  analogWrite(PWMA, 0);
+  
+  digitalWrite(BIN1, LOW);
+  digitalWrite(BIN2, LOW);
+  analogWrite(PWMB, 0);
+}
+
+bool checkLineVisibility() {
+  // Check if any sensor sees the line
+  bool lineVisible = false;
+  
+  for (uint8_t i = 0; i < NUM_SENSORS; i++) {
+    if (sensorValues[i] < LINE_LOST_THRESHOLD) {
+      lineVisible = true;
+      break;
+    }
+  }
+  
+  return lineVisible;
+}
+
+void handleLineLost() {
+  // If line was just lost, record time
+  if (!lineLost) {
+    lineLost = true;
+  }
+  
+  // Determine recovery direction based on last known error
+  if (lastError > 0) {
+    // Line was on the right, so turn right
+    digitalWrite(AIN1, HIGH);
+    digitalWrite(AIN2, LOW);
+    analogWrite(PWMA, RECOVERY_SPEED);
+    
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, HIGH);
+    analogWrite(PWMB, RECOVERY_SPEED / 2);
+  } else {
+    // Line was on the left, so turn left
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, HIGH);
+    analogWrite(PWMA, RECOVERY_SPEED / 2);
+    
+    digitalWrite(BIN1, HIGH);
+    digitalWrite(BIN2, LOW);
+    analogWrite(PWMB, RECOVERY_SPEED);
+  }
+  
+  // Safety timeout - if line is lost for too long, stop
+  if (millis() - lineLastSeen > 5000) {
+    stopMotors();
+    runningMode = false;
+    Serial.println(F("ERROR: Line lost for too long, stopping"));
+  }
+}
+
+void calibrateSensors() {
+  digitalWrite(LED_BUILTIN, HIGH);
+  Serial.println(F("Calibrating sensors..."));
+  
+  // Move the robot slightly during calibration to see different surface areas
+  for (uint16_t i = 0; i < CALIBRATION_SAMPLES; i++) {
+    // Wiggle motors to improve calibration
+    if (i % 50 < 25) {
+      digitalWrite(AIN1, HIGH);
+      digitalWrite(AIN2, LOW);
+      analogWrite(PWMA, 60);
+      digitalWrite(BIN1, LOW);
+      digitalWrite(BIN2, HIGH);
+      analogWrite(PWMB, 60);
+    } else {
+      digitalWrite(AIN1, LOW);
+      digitalWrite(AIN2, HIGH);
+      analogWrite(PWMA, 60);
+      digitalWrite(BIN1, HIGH);
+      digitalWrite(BIN2, LOW);
+      analogWrite(PWMB, 60);
+    }
+    
+    qtr.calibrate();
+    delay(10);
+  }
+  
+  stopMotors();
+  digitalWrite(LED_BUILTIN, LOW);
+  Serial.println(F("Calibration complete"));
+  
+  // Print calibration min/max values
+  Serial.println(F("Calibration values:"));
+  for (uint8_t i = 0; i < NUM_SENSORS; i++) {
+    Serial.print(F("Sensor "));
+    Serial.print(i);
+    Serial.print(F(": Min="));
+    Serial.print(qtr.calibrationOn.minimum[i]);
+    Serial.print(F(" Max="));
+    Serial.println(qtr.calibrationOn.maximum[i]);
+  }
+}
+
+void resetPID() {
+  error = 0;
+  lastError = 0;
+  integral = 0;
+  derivative = 0;
+}
+
+void checkUserInput() {
+  // Check button if configured
+  if (BUTTON_PIN != -1 && digitalRead(BUTTON_PIN) == LOW) {
+    // Debounce
+    delay(50);
+    if (digitalRead(BUTTON_PIN) == LOW) {
+      runningMode = !runningMode;
+      resetPID();
+      
+      Serial.print(F("Robot "));
+      Serial.println(runningMode ? F("started") : F("stopped"));
+      
+      // Wait for button release
+      while (digitalRead(BUTTON_PIN) == LOW) {
+        delay(10);
+      }
+    }
+  }
+  
+  // Check serial commands
+  if (Serial.available()) {
+    processSerialCommands();
+  }
+}
+
+void processSerialCommands() {
+  char cmd = Serial.read();
+  float value;
+  
+  switch (cmd) {
+    case 'P':  // Set Kp value
+      value = Serial.parseFloat();
+      if (value >= 0) {
+        Kp = value;
+        Serial.print(F("Kp set to: "));
+        Serial.println(Kp, 5);
+      }
+      break;
+      
+    case 'I':  // Set Ki value
+      value = Serial.parseFloat();
+      if (value >= 0) {
+        Ki = value;
+        Serial.print(F("Ki set to: "));
+        Serial.println(Ki, 5);
+      }
+      break;
+      
+    case 'D':  // Set Kd value 
+      value = Serial.parseFloat();
+      if (value >= 0) {
+        Kd = value;
+        Serial.print(F("Kd set to: "));
+        Serial.println(Kd, 5);
+      }
+      break;
+      
+    case 'S':  // Set base speed
+      value = Serial.parseFloat();
+      if (value > 0 && value <= MAX_SPEED) {
+        BASE_SPEED = value;
+        Serial.print(F("Base speed set to: "));
+        Serial.println(BASE_SPEED);
+      }
+      break;
+      
+    case 'R':  // Run/Stop robot
+      value = Serial.parseInt();
+      runningMode = (value == 1);
+      resetPID();
+      Serial.print(F("Robot "));
+      Serial.println(runningMode ? F("started") : F("stopped"));
+      break;
+      
+    case 'C':  // Re-calibrate sensors
+      calibrateSensors();
+      break;
+      
+    case '?':  // Print help
+      printHelp();
+      break;
+      
+    case 'V':  // Print values
+      printSystemInfo();
+      break;
+      
+    default:
+      // Clear the buffer for invalid commands
+      while (Serial.available() > 0) {
+        Serial.read();
+      }
+      break;
+  }
+}
+
+void printSystemInfo() {
+  Serial.println(F("\n===== Line Follower Status ====="));
+  Serial.print(F("PID: Kp="));
+  Serial.print(Kp, 5);
+  Serial.print(F(" Ki="));
+  Serial.print(Ki, 5);
+  Serial.print(F(" Kd="));
+  Serial.println(Kd, 5);
+  Serial.print(F("Base Speed: "));
+  Serial.println(BASE_SPEED);
+  Serial.print(F("Status: "));
+  Serial.println(runningMode ? F("Running") : F("Stopped"));
+  Serial.println(F("==============================="));
+}
+
+void printDebugInfo() {
+  Serial.print(F("Pos:"));
+  Serial.print(positionValue);
+  Serial.print(F(" E:"));
+  Serial.print(error);
+  Serial.print(F(" P:"));
+  Serial.print(Kp * error);
+  Serial.print(F(" I:"));
+  Serial.print(Ki * integral);
+  Serial.print(F(" D:"));
+  Serial.print(Kd * derivative);
+  Serial.print(F(" M:"));
+  Serial.println(motorSpeed);
+  
+  // Print sensor values
+  Serial.print(F("Sensors: "));
+  for (uint8_t i = 0; i < NUM_SENSORS; i++) {
+    Serial.print(sensorValues[i]);
+    Serial.print(" ");
+  }
+  Serial.println();
+}
+
+void printHelp() {
+  Serial.println(F("\n===== LINE FOLLOWER COMMANDS ====="));
+  Serial.println(F("P{value} - Set Kp value (example: P0.25)"));
+  Serial.println(F("I{value} - Set Ki value (example: I0.0001)"));
+  Serial.println(F("D{value} - Set Kd value (example: D2.0)"));
+  Serial.println(F("S{value} - Set base speed (example: S170)"));
+  Serial.println(F("R1 - Start robot"));
+  Serial.println(F("R0 - Stop robot"));
+  Serial.println(F("C - Calibrate sensors"));
+  Serial.println(F("V - View current settings"));
+  Serial.println(F("? - Print this help message"));
+  Serial.println(F("================================="));
+}
