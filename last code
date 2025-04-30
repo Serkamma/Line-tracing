@@ -1,0 +1,427 @@
+/**
+ * Line Follower Robot with PID Control and HC-05 Bluetooth
+ * 
+ * Components:
+ * - Arduino Uno
+ * - L298N Motor Driver
+ * - QTR-8A Analog Sensor Array (instead of QTR-8RC)
+ * - N20 DC Gear Motors with Wheels
+ * - HC-05 Bluetooth Module
+ * - 11.1V LiPo Battery
+ * 
+ * Connections:
+ * - Arduino D3 -> L298N IN1
+ * - Arduino D4 -> L298N IN2
+ * - Arduino D5 -> L298N ENA (PWM)
+ * - Arduino D6 -> L298N IN3
+ * - Arduino D7 -> L298N IN4
+ * - Arduino D8 -> L298N ENB (PWM)
+ * - Arduino 5V -> QTR-8A VCC and HC-05 VCC
+ * - Arduino GND -> L298N GND, QTR-8A GND, and HC-05 GND
+ * - L298N +12V -> 11.1V LiPo Battery (+)
+ * - L298N GND -> 11.1V LiPo Battery (-)
+ * - Arduino A0-A4 -> QTR-8A OUT1-OUT5 (using 5 sensors out of 8)
+ * - Arduino D0(RX) -> HC-05 TX
+ * - Arduino D1(TX) -> HC-05 RX (through voltage divider: 1k to HC-05, 2k to GND)
+ * - L298N OUT1, OUT2 -> Motor 1
+ * - L298N OUT3, OUT4 -> Motor 2
+ */
+
+#include <QTRSensors.h>
+#include <SoftwareSerial.h>
+
+// Define motor driver pins
+#define IN1 3    // Motor 1 direction control 1
+#define IN2 4    // Motor 1 direction control 2
+#define ENA 5    // Motor 1 speed control (PWM)
+#define IN3 6    // Motor 2 direction control 1
+#define IN4 7    // Motor 2 direction control 2
+#define ENB 8    // Motor 2 speed control (PWM)
+
+// Define HC-05 Bluetooth pins
+#define BT_RX 0    // Connect to HC-05 TX
+#define BT_TX 1    // Connect to HC-05 RX (through voltage divider)
+
+// Define QTR sensor pins and parameters
+#define NUM_SENSORS 5    // Number of sensors used in the QTR-8A (using 5 out of 8)
+#define EMITTER_PIN 2    // Emitter control pin
+
+// Motor speed settings - adjusted for N20 motors
+#define MAX_SPEED 255    // Maximum motor speed (0-255)
+#define BASE_SPEED 100   // Base motor speed (start lower for N20 motors)
+
+// PID Control parameters
+// These values will need fine-tuning based on your specific robot
+float Kp = 0.2;        // Start with lower proportional gain for analog sensors
+float Ki = 0.0001;     // Integral gain
+float Kd = 2.0;        // Derivative gain
+
+// PID variables
+int lastError = 0;     // Last position error
+float integral = 0;    // Integral term accumulator
+
+// Operation mode
+enum Mode {
+  AUTO,       // Autonomous line following
+  MANUAL,     // Manual control via Bluetooth
+  CALIBRATE   // Sensor calibration mode
+};
+
+Mode currentMode = AUTO;
+
+// Initialize QTRSensors object
+QTRSensors qtr;
+
+// Initialize Bluetooth serial
+SoftwareSerial bluetooth(BT_RX, BT_TX);
+
+// Array to hold sensor values
+uint16_t sensorValues[NUM_SENSORS];
+
+// Position reference (with analog sensors, typically 0-1000 per sensor)
+int setpoint = 2000;  // Middle position (0-4000 for 5 sensors)
+
+// Timing for Bluetooth telemetry
+unsigned long lastTelemetryTime = 0;
+const int telemetryInterval = 500;  // Send data every 500ms
+
+// Process command received via Bluetooth
+void processCommand(char command) {
+  switch (command) {
+    case 'A': // Switch to autonomous mode
+      currentMode = AUTO;
+      bluetooth.println("Mode: Autonomous");
+      break;
+    case 'M': // Switch to manual mode
+      currentMode = MANUAL;
+      stopMotors();
+      bluetooth.println("Mode: Manual");
+      break;
+    case 'C': // Start calibration
+      currentMode = CALIBRATE;
+      bluetooth.println("Starting calibration...");
+      calibrateSensors();
+      currentMode = AUTO; // Return to auto mode after calibration
+      break;
+    case 'F': // Forward (manual mode)
+      if (currentMode == MANUAL) {
+        moveForward();
+        bluetooth.println("Moving forward");
+      }
+      break;
+    case 'B': // Backward (manual mode)
+      if (currentMode == MANUAL) {
+        moveBackward();
+        bluetooth.println("Moving backward");
+      }
+      break;
+    case 'L': // Left (manual mode)
+      if (currentMode == MANUAL) {
+        turnLeft();
+        bluetooth.println("Turning left");
+      }
+      break;
+    case 'R': // Right (manual mode)
+      if (currentMode == MANUAL) {
+        turnRight();
+        bluetooth.println("Turning right");
+      }
+      break;
+    case 'S': // Stop (manual mode)
+      if (currentMode == MANUAL) {
+        stopMotors();
+        bluetooth.println("Stopped");
+      }
+      break;
+    case 'P': // Increase Kp
+      Kp += 0.05;
+      bluetooth.print("Kp: ");
+      bluetooth.println(Kp);
+      break;
+    case 'p': // Decrease Kp
+      Kp = max(0.0, Kp - 0.05);
+      bluetooth.print("Kp: ");
+      bluetooth.println(Kp);
+      break;
+    case 'I': // Increase Ki
+      Ki += 0.00005;
+      bluetooth.print("Ki: ");
+      bluetooth.println(Ki, 6);
+      break;
+    case 'i': // Decrease Ki
+      Ki = max(0.0, Ki - 0.00005);
+      bluetooth.print("Ki: ");
+      bluetooth.println(Ki, 6);
+      break;
+    case 'D': // Increase Kd
+      Kd += 0.5;
+      bluetooth.print("Kd: ");
+      bluetooth.println(Kd);
+      break;
+    case 'd': // Decrease Kd
+      Kd = max(0.0, Kd - 0.5);
+      bluetooth.print("Kd: ");
+      bluetooth.println(Kd);
+      break;
+    case '+': // Increase base speed
+      BASE_SPEED = min(255, BASE_SPEED + 10);
+      bluetooth.print("Speed: ");
+      bluetooth.println(BASE_SPEED);
+      break;
+    case '-': // Decrease base speed
+      BASE_SPEED = max(50, BASE_SPEED - 10);
+      bluetooth.print("Speed: ");
+      bluetooth.println(BASE_SPEED);
+      break;
+    default:
+      break;
+  }
+}
+
+void setup() {
+  // Initialize motor control pins
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(ENA, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  pinMode(ENB, OUTPUT);
+  
+  // Initialize serial communication for debugging
+  Serial.begin(9600);
+  
+  // Initialize Bluetooth communication
+  bluetooth.begin(9600); // Default HC-05 baud rate
+  bluetooth.println("Line Follower Robot initialized");
+  
+  // Configure QTR sensors - This is different for QTR-8A
+  qtr.setTypeAnalog();
+  qtr.setSensorPins((const uint8_t[]){A0, A1, A2, A3, A4}, NUM_SENSORS);
+  qtr.setEmitterPin(EMITTER_PIN);
+  
+  // Initial calibration
+  calibrateSensors();
+  
+  // Short delay before starting
+  delay(1000);
+  
+  // Send initial PID values
+  sendPIDValues();
+}
+
+void calibrateSensors() {
+  bluetooth.println("Calibrating QTR sensors...");
+  
+  // Turn on LED to indicate calibration mode
+  digitalWrite(LED_BUILTIN, HIGH);
+  
+  // Turn on motors to move during calibration
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+  
+  // Calibration movement: rotate left and right to capture min/max readings
+  for (int i = 0; i < 120; i++) {
+    // Move left for first half of calibration
+    if (i < 30 || (i >= 60 && i < 90)) {
+      analogWrite(ENA, 70);  // Lower calibration speed for N20 motors
+      analogWrite(ENB, 70);
+    } 
+    // Move right for second half of calibration
+    else {
+      analogWrite(ENA, 70);  // Lower calibration speed for N20 motors
+      analogWrite(ENB, 70);
+      digitalWrite(IN1, HIGH);
+      digitalWrite(IN2, LOW);
+      digitalWrite(IN3, LOW);
+      digitalWrite(IN4, HIGH);
+    }
+    
+    // Calibrate the sensor (takes 10ms per reading)
+    qtr.calibrate();
+    delay(10);
+  }
+  
+  // Stop motors after calibration
+  stopMotors();
+  
+  // Turn off LED
+  digitalWrite(LED_BUILTIN, LOW);
+  
+  bluetooth.println("Calibration done!");
+  
+  // Print calibration values
+  bluetooth.print("Min: ");
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    bluetooth.print(qtr.calibrationOn.minimum[i]);
+    bluetooth.print(" ");
+  }
+  bluetooth.println();
+  
+  bluetooth.print("Max: ");
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    bluetooth.print(qtr.calibrationOn.maximum[i]);
+    bluetooth.print(" ");
+  }
+  bluetooth.println();
+}
+
+void loop() {
+  // Check for Bluetooth commands
+  if (bluetooth.available()) {
+    char command = bluetooth.read();
+    processCommand(command);
+  }
+  
+  // Mode specific operations
+  switch (currentMode) {
+    case AUTO:
+      followLine();
+      break;
+    case MANUAL:
+      // Manual control is handled by processCommand()
+      break;
+    case CALIBRATE:
+      // Calibration is handled separately
+      break;
+  }
+  
+  // Send telemetry data at regular intervals
+  if (millis() - lastTelemetryTime > telemetryInterval) {
+    sendTelemetry();
+    lastTelemetryTime = millis();
+  }
+}
+
+void followLine() {
+  // Read position (0-4000 for 5 sensors, with 0 = leftmost, 4000 = rightmost)
+  uint16_t position = qtr.readLineBlack(sensorValues);
+  
+  // Calculate PID error (how far from the middle position)
+  int error = position - setpoint;
+  
+  // Calculate integral term (accumulated error over time)
+  integral += error;
+  
+  // Constrain integral to prevent windup
+  integral = constrain(integral, -10000, 10000);
+  
+  // Calculate derivative term (rate of change of error)
+  int derivative = error - lastError;
+  
+  // Calculate PID output
+  int pidOutput = Kp * error + Ki * integral + Kd * derivative;
+  
+  // Store current error for next iteration
+  lastError = error;
+  
+  // Calculate motor speeds based on PID output
+  int leftMotorSpeed = BASE_SPEED + pidOutput;
+  int rightMotorSpeed = BASE_SPEED - pidOutput;
+  
+  // Constrain speeds to valid range
+  leftMotorSpeed = constrain(leftMotorSpeed, 0, MAX_SPEED);
+  rightMotorSpeed = constrain(rightMotorSpeed, 0, MAX_SPEED);
+  
+  // Set motor direction and speeds
+  // Left motor
+  if (leftMotorSpeed > 0) {
+    digitalWrite(IN1, LOW);   // Forward
+    digitalWrite(IN2, HIGH);
+  } else {
+    digitalWrite(IN1, HIGH);  // Reverse
+    digitalWrite(IN2, LOW);
+  }
+  
+  // Right motor
+  if (rightMotorSpeed > 0) {
+    digitalWrite(IN3, HIGH);  // Forward
+    digitalWrite(IN4, LOW);
+  } else {
+    digitalWrite(IN3, LOW);   // Reverse
+    digitalWrite(IN4, HIGH);
+  }
+  
+  // Set motor speeds
+  analogWrite(ENA, abs(leftMotorSpeed));
+  analogWrite(ENB, abs(rightMotorSpeed));
+}
+
+void moveForward() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+  analogWrite(ENA, BASE_SPEED);
+  analogWrite(ENB, BASE_SPEED);
+}
+
+void moveBackward() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+  analogWrite(ENA, BASE_SPEED);
+  analogWrite(ENB, BASE_SPEED);
+}
+
+void turnLeft() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+  analogWrite(ENA, BASE_SPEED);
+  analogWrite(ENB, BASE_SPEED);
+}
+
+void turnRight() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+  analogWrite(ENA, BASE_SPEED);
+  analogWrite(ENB, BASE_SPEED);
+}
+
+void stopMotors() {
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+}
+
+void sendPIDValues() {
+  bluetooth.print("PID Values - Kp: ");
+  bluetooth.print(Kp);
+  bluetooth.print(" Ki: ");
+  bluetooth.print(Ki, 6);
+  bluetooth.print(" Kd: ");
+  bluetooth.println(Kd);
+  bluetooth.print("Base Speed: ");
+  bluetooth.println(BASE_SPEED);
+}
+
+void sendTelemetry() {
+  // Read sensor values
+  uint16_t position = qtr.readLineBlack(sensorValues);
+  
+  // Send position data
+  bluetooth.print("Pos:");
+  bluetooth.print(position);
+  
+  // Send individual sensor values
+  bluetooth.print(" S:");
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    bluetooth.print(sensorValues[i]);
+    bluetooth.print(",");
+  }
+  
+  // Send error and mode
+  bluetooth.print(" E:");
+  bluetooth.print(position - setpoint);
+  
+  // Send current mode
+  bluetooth.print(" M:");
+  bluetooth.print(currentMode == AUTO ? "A" : (currentMode == MANUAL ? "M" : "C"));
+  
+  bluetooth.println();
+}
